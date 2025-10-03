@@ -21,8 +21,8 @@ app.add_middleware(
 	allow_headers=["*"],
 )
 
-BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-DATA_DIR = os.path.join(BASE_DIR, "data")
+BACKEND_DIR = os.path.dirname(__file__)
+DATA_DIR = os.path.join(BACKEND_DIR, "data")
 DATA_CSV = os.path.join(DATA_DIR, "kimchi_premium_daily.csv")
 
 
@@ -162,15 +162,37 @@ def get_realtime(symbol: str = Path(..., description="BTC|ETH|SOL|DOGE|XRP|ADA")
 		upbit_krw = float(upbit_ticker)
 		# USDKRW: 최근 영업일 값 (캐시 파일이 있으면 마지막 값 사용, 없으면 스크래퍼로 오늘~오늘 호출)
 		usdkrw = None
+		# 1) 심볼 캐시 JSON의 최근 usdkrw 사용
 		cache_any = _load_cache_json(_cache_json_path("BTC"))
 		if isinstance(cache_any, list) and len(cache_any) > 0:
-			usdkrw = float(cache_any[-1].get("usdkrw"))
+			try:
+				usdkrw = float(cache_any[-1].get("usdkrw"))
+			except Exception:
+				usdkrw = None
+		# 2) CSV 캐시가 있으면 최근 값 사용
+		if usdkrw is None and os.path.exists(DATA_CSV):
+			try:
+				csv_df = pd.read_csv(DATA_CSV)
+				if "usdkrw" in csv_df.columns and not csv_df.empty:
+					usdkrw = float(csv_df.iloc[-1]["usdkrw"])  # 마지막 행
+			except Exception:
+				usdkrw = None
+		# 3) 최근 14일 구간 스크래핑 후 가장 최근 값 사용(주말/휴일 포함, ffill 허용)
 		if usdkrw is None:
 			from dollar_scraper import get_usd_rates_df
-			from datetime import date
-			today = date.today().strftime("%Y-%m-%d")
-			df = get_usd_rates_df(today, today)
-			usdkrw = float(df.iloc[-1]["usd_rate"]) if not df.empty else 1300.0
+			from datetime import date, timedelta
+			today = date.today()
+			start = (today - timedelta(days=14)).strftime("%Y-%m-%d")
+			end = today.strftime("%Y-%m-%d")
+			df = get_usd_rates_df(start, end)
+			if not df.empty:
+				try:
+					usdkrw = float(df.iloc[-1]["usd_rate"])  # 마지막 가용값(주말이면 ffill된 값)
+				except Exception:
+					usdkrw = None
+		# 4) 최종 폴백(비상용)
+		if usdkrw is None:
+			usdkrw = 1300.0
 		# kimchi premium in real-time
 		kimchi_pct = (upbit_krw / (binance_usdt * usdkrw) - 1.0) * 100.0
 		return {

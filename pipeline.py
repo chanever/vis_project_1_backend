@@ -87,18 +87,46 @@ def fetch_upbit_krw_daily(start_date: str, end_date: str, base_symbol: str = "BT
 	"""Fetch Upbit KRW-{BASE} daily close. Return [date, krw_close]."""
 	base = _validate_base_symbol(base_symbol)
 	market = f"KRW-{base}"
+	# Upbit 단일 호출로 긴 기간(count가 매우 클 때)이 실패하는 경우가 있어, 200일 단위로 백필 페이징
 	end_dt = pd.to_datetime(end_date) + pd.Timedelta(days=1)
-	count_days = (pd.to_datetime(end_date) - pd.to_datetime(start_date)).days + 5
-	df = pyupbit.get_ohlcv(market, interval="day", count=count_days, to=end_dt.strftime("%Y-%m-%d %H:%M:%S"))
-	if df is None or df.empty:
+	start_dt = pd.to_datetime(start_date)
+	to_ptr = end_dt
+	chunks = []
+	max_batch = 200
+	max_iters = 200  # 안전장치(최대 ~ 40,000일)
+	for _ in range(max_iters):
+		# 최신에서 과거로 200개 단위 페이징
+		part = pyupbit.get_ohlcv(
+			market,
+			interval="day",
+			count=max_batch,
+			to=to_ptr.strftime("%Y-%m-%d %H:%M:%S"),
+		)
+		if part is None or part.empty:
+			break
+		chunks.append(part)
+		oldest_ts = pd.to_datetime(part.index.min())
+		# 다음 루프용 포인터를 가장 오래된 캔들 직전 시각으로 이동
+		to_ptr = oldest_ts - pd.Timedelta(minutes=1)
+		# 이미 수집한 가장 오래된 날짜가 시작일 이전이면 중단
+		if oldest_ts.date() <= start_dt.date():
+			break
+		# API 과호출 방지
+		time.sleep(0.2)
+
+	if not chunks:
 		return pd.DataFrame(columns=["date", "krw_close"]) 
-	
-	df = df.copy()
-	df["date"] = pd.to_datetime(df.index.date)
-	df = df[["date", "close"]].rename(columns={"close": "krw_close"})
-	mask = (df["date"] >= pd.to_datetime(start_date)) & (df["date"] <= pd.to_datetime(end_date))
-	df = df.loc[mask].drop_duplicates(subset=["date"]).sort_values("date").reset_index(drop=True)
-	return df
+
+	# 수집한 조각 병합 후 정제
+	merged = pd.concat(chunks, axis=0)
+	merged = merged[~merged.index.duplicated(keep="last")]  # 중복 제거
+	merged = merged.sort_index()
+	res = merged.copy()
+	res["date"] = pd.to_datetime(res.index.date)
+	res = res[["date", "close"]].rename(columns={"close": "krw_close"})
+	mask = (res["date"] >= start_dt) & (res["date"] <= pd.to_datetime(end_date))
+	res = res.loc[mask].drop_duplicates(subset=["date"]).sort_values("date").reset_index(drop=True)
+	return res
 
 
 def fetch_greed_index_daily(start_date: str, end_date: str) -> pd.DataFrame:
