@@ -4,11 +4,13 @@ from fastapi import FastAPI, Query, Path
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse
 from datetime import date, timedelta, datetime, timezone
+from zoneinfo import ZoneInfo
 import pandas as pd
 import ccxt
 import pyupbit
 
 from pipeline import load_or_build_dataset, save_csv
+from cmc_dominance import get_btc_dominance
 
 app = FastAPI(title="Kimchi Premium API")
 
@@ -23,7 +25,23 @@ app.add_middleware(
 
 BACKEND_DIR = os.path.dirname(__file__)
 DATA_DIR = os.path.join(BACKEND_DIR, "data")
-DATA_CSV = os.path.join(DATA_DIR, "kimchi_premium_daily.csv")
+
+def _symbol_csv_path(symbol: str) -> str:
+    sym = (symbol or "BTC").upper()
+    return os.path.join(DATA_DIR, f"kimchi_premium_daily_{sym}.csv")
+
+def _effective_end_date(requested_end: str) -> str:
+    """Return end date respecting KST 09:30 daily data availability.
+    - Before 09:30 KST: use yesterday
+    - At/after 09:30 KST: today
+    Also clamp to the client-requested end.
+    """
+    kst_now = datetime.now(ZoneInfo("Asia/Seoul"))
+    cutoff = kst_now.replace(hour=9, minute=30, second=0, microsecond=0)
+    available_end = (kst_now.date() if kst_now >= cutoff else (kst_now.date() - timedelta(days=1)))
+    req_end = pd.to_datetime(requested_end).date()
+    eff_end = min(req_end, available_end)
+    return pd.Timestamp(eff_end).strftime("%Y-%m-%d")
 
 
 @app.get("/health")
@@ -31,10 +49,35 @@ def health():
 	return {"status": "ok"}
 
 
+@app.get("/btc_dominance")
+def btc_dominance():
+    try:
+        payload = get_btc_dominance()
+        return JSONResponse(content=payload)
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
 @app.get("/dataset")
 def get_dataset(start: str = Query(...), end: str = Query(...), symbol: str = Query("BTC")):
 	try:
-		df = load_or_build_dataset(start, end, cache_path=os.path.abspath(DATA_CSV), use_cache=True, base_symbol=symbol)
+		# KST 09:30 컷오프 반영 및 심볼별 CSV 경로
+		symbol = (symbol or "BTC").upper()
+		eff_end = _effective_end_date(end)
+		# 캐시 최신성 검사: CSV 마지막 날짜가 eff_end보다 이전이면 재생성
+		use_cache = True
+		csv_path = os.path.abspath(_symbol_csv_path(symbol))
+		if os.path.exists(csv_path):
+			try:
+				cached = pd.read_csv(csv_path, parse_dates=["date"]) if os.path.getsize(csv_path) > 0 else None
+				if cached is not None and not cached.empty:
+					last_dt = pd.to_datetime(cached.iloc[-1]["date"]).normalize()
+					req_end = pd.to_datetime(eff_end).normalize()
+					if last_dt < req_end:
+						use_cache = False
+			except Exception:
+				use_cache = True
+		df = load_or_build_dataset(start, eff_end, cache_path=csv_path, use_cache=use_cache, base_symbol=symbol)
 		df = df.copy()
 		df["date"] = df["date"].dt.strftime("%Y-%m-%d")
 		return JSONResponse(content=df.to_dict(orient="records"))
@@ -67,13 +110,8 @@ def get_dataset_symbol_2025(symbol: str = Path(..., description="BTC|ETH|SOL|DOG
 	try:
 		start = "2025-01-01"; end = "2025-09-30"
 		symbol = symbol.upper()
-		cache_path = _cache_json_path(symbol)
-		if not refresh:
-			cache = _load_cache_json(cache_path)
-			if isinstance(cache, list) and any(r.get("timestamp") == end for r in cache):
-				return JSONResponse(content=cache)
-		# build
-		df = load_or_build_dataset(start, end, cache_path=None, use_cache=False, base_symbol=symbol)
+		csv_path = os.path.abspath(_symbol_csv_path(symbol))
+		df = load_or_build_dataset(start, end, cache_path=csv_path, use_cache=True, base_symbol=symbol)
 		df = df.copy()
 		df["upbit_usdt"] = df["krw_close"] / df["usdkrw"]
 		records = []
@@ -89,7 +127,6 @@ def get_dataset_symbol_2025(symbol: str = Path(..., description="BTC|ETH|SOL|DOG
 				"usd_ffill": bool(row.get("usd_ffill", False)) if "usd_ffill" in row else False,
 				"greed_ffill": bool(row.get("greed_ffill", False)) if "greed_ffill" in row else False,
 			})
-		_save_cache_json(cache_path, records)
 		return JSONResponse(content=records)
 	except Exception as e:
 		return JSONResponse(status_code=500, content={"error": str(e)})
@@ -100,12 +137,8 @@ def get_dataset_symbol_2025_alt(symbol: str = Path(..., description="BTC|ETH|SOL
 	try:
 		start = "2025-01-01"; end = "2025-09-30"
 		symbol = symbol.upper()
-		cache_path = _cache_json_path(symbol)
-		if not refresh:
-			cache = _load_cache_json(cache_path)
-			if isinstance(cache, list) and any(r.get("timestamp") == end for r in cache):
-				return JSONResponse(content=cache)
-		df = load_or_build_dataset(start, end, cache_path=None, use_cache=False, base_symbol=symbol)
+		csv_path = os.path.abspath(_symbol_csv_path(symbol))
+		df = load_or_build_dataset(start, end, cache_path=csv_path, use_cache=True, base_symbol=symbol)
 		df = df.copy()
 		df["upbit_usdt"] = df["krw_close"] / df["usdkrw"]
 		records = []
@@ -121,7 +154,6 @@ def get_dataset_symbol_2025_alt(symbol: str = Path(..., description="BTC|ETH|SOL
 				"usd_ffill": bool(row.get("usd_ffill", False)) if "usd_ffill" in row else False,
 				"greed_ffill": bool(row.get("greed_ffill", False)) if "greed_ffill" in row else False,
 			})
-		_save_cache_json(cache_path, records)
 		return JSONResponse(content=records)
 	except Exception as e:
 		return JSONResponse(status_code=500, content={"error": str(e)})
@@ -129,9 +161,12 @@ def get_dataset_symbol_2025_alt(symbol: str = Path(..., description="BTC|ETH|SOL
 
 @app.get("/download")
 def download_csv(start: str, end: str, symbol: str = Query("BTC")):
-	df = load_or_build_dataset(start, end, cache_path=os.path.abspath(DATA_CSV), use_cache=False, base_symbol=symbol)
-	save_csv(df, os.path.abspath(DATA_CSV))
-	return FileResponse(os.path.abspath(DATA_CSV), media_type="text/csv", filename="kimchi_premium_daily.csv")
+	symbol = (symbol or "BTC").upper()
+	eff_end = _effective_end_date(end)
+	csv_path = os.path.abspath(_symbol_csv_path(symbol))
+	df = load_or_build_dataset(start, eff_end, cache_path=csv_path, use_cache=False, base_symbol=symbol)
+	save_csv(df, csv_path)
+	return FileResponse(csv_path, media_type="text/csv", filename=f"kimchi_premium_daily_{symbol}.csv")
 
 
 @app.get("/realtime/{symbol}")
@@ -162,19 +197,18 @@ def get_realtime(symbol: str = Path(..., description="BTC|ETH|SOL|DOGE|XRP|ADA")
 		upbit_krw = float(upbit_ticker)
 		# USDKRW: 최근 영업일 값 (캐시 파일이 있으면 마지막 값 사용, 없으면 스크래퍼로 오늘~오늘 호출)
 		usdkrw = None
-		# 1) 심볼 캐시 JSON의 최근 usdkrw 사용
-		cache_any = _load_cache_json(_cache_json_path("BTC"))
-		if isinstance(cache_any, list) and len(cache_any) > 0:
+		# CSV 캐시에서 최근 usdkrw 사용(우선 BTC, 없으면 아무 심볼)
+		preferred = os.path.abspath(_symbol_csv_path("BTC"))
+		csv_paths = []
+		if os.path.exists(preferred):
+			csv_paths.append(preferred)
+		csv_paths.extend([os.path.join(DATA_DIR, p) for p in os.listdir(DATA_DIR) if p.startswith("kimchi_premium_daily_") and p.endswith(".csv")])
+		for p in csv_paths:
 			try:
-				usdkrw = float(cache_any[-1].get("usdkrw"))
-			except Exception:
-				usdkrw = None
-		# 2) CSV 캐시가 있으면 최근 값 사용
-		if usdkrw is None and os.path.exists(DATA_CSV):
-			try:
-				csv_df = pd.read_csv(DATA_CSV)
+				csv_df = pd.read_csv(p)
 				if "usdkrw" in csv_df.columns and not csv_df.empty:
 					usdkrw = float(csv_df.iloc[-1]["usdkrw"])  # 마지막 행
+					break
 			except Exception:
 				usdkrw = None
 		# 3) 최근 14일 구간 스크래핑 후 가장 최근 값 사용(주말/휴일 포함, ffill 허용)
