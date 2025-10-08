@@ -80,5 +80,5 @@ def get_usd_rates_df(start_date: str, end_date: str) -> pd.DataFrame:
     df["date"] = pd.to_datetime(df["date"])  # naive date
     df = df.sort_values("date").reset_index(drop=True)
     return df
-
+ 
 # 테스트 실행 제거 (모듈 import 시 출력 방지)

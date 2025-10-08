@@ -11,6 +11,7 @@ import pyupbit
 
 from pipeline import load_or_build_dataset, save_csv
 from cmc_dominance import get_btc_dominance
+from dollar_scraper import get_usd_rates_df
 
 app = FastAPI(title="Kimchi Premium API")
 
@@ -130,7 +131,6 @@ def get_dataset_symbol_2025(symbol: str = Path(..., description="BTC|ETH|SOL|DOG
 		return JSONResponse(content=records)
 	except Exception as e:
 		return JSONResponse(status_code=500, content={"error": str(e)})
-
 
 @app.get("/dataset/2025/{symbol}")
 def get_dataset_symbol_2025_alt(symbol: str = Path(..., description="BTC|ETH|SOL|DOGE|XRP|ADA"), refresh: bool = Query(False)):
