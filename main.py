@@ -31,6 +31,25 @@ def _symbol_csv_path(symbol: str) -> str:
     sym = (symbol or "BTC").upper()
     return os.path.join(DATA_DIR, f"kimchi_premium_daily_{sym}.csv")
 
+_SYMBOL_LISTING_START = {
+    # 보수적으로 2020-01-01을 기본 시작일로 사용
+    "BTC": "2020-01-01",
+    "ETH": "2020-01-01",
+    "XRP": "2020-01-01",
+    "ADA": "2020-01-01",
+    # 사용자 요구: DOGE, SOL은 2021년부터 데이터 제공
+    "DOGE": "2021-01-01",
+    "SOL": "2021-01-01",
+}
+
+def _clamp_start_by_symbol(symbol: str, requested_start: str) -> str:
+    sym = (symbol or "BTC").upper()
+    base = _SYMBOL_LISTING_START.get(sym, "2020-01-01")
+    req = pd.to_datetime(requested_start).date()
+    bas = pd.to_datetime(base).date()
+    eff = max(req, bas)
+    return pd.Timestamp(eff).strftime("%Y-%m-%d")
+
 def _effective_end_date(requested_end: str) -> str:
     """Return end date respecting KST 09:30 daily data availability.
     - Before 09:30 KST: use yesterday
@@ -65,20 +84,10 @@ def get_dataset(start: str = Query(...), end: str = Query(...), symbol: str = Qu
 		# KST 09:30 컷오프 반영 및 심볼별 CSV 경로
 		symbol = (symbol or "BTC").upper()
 		eff_end = _effective_end_date(end)
-		# 캐시 최신성 검사: CSV 마지막 날짜가 eff_end보다 이전이면 재생성
-		use_cache = True
+		eff_start = _clamp_start_by_symbol(symbol, start)
 		csv_path = os.path.abspath(_symbol_csv_path(symbol))
-		if os.path.exists(csv_path):
-			try:
-				cached = pd.read_csv(csv_path, parse_dates=["date"]) if os.path.getsize(csv_path) > 0 else None
-				if cached is not None and not cached.empty:
-					last_dt = pd.to_datetime(cached.iloc[-1]["date"]).normalize()
-					req_end = pd.to_datetime(eff_end).normalize()
-					if last_dt < req_end:
-						use_cache = False
-			except Exception:
-				use_cache = True
-		df = load_or_build_dataset(start, eff_end, cache_path=csv_path, use_cache=use_cache, base_symbol=symbol)
+		# 항상 증분 캐시 로직을 사용(앞/뒤/소규모 중간 결손 보충)
+		df = load_or_build_dataset(eff_start, eff_end, cache_path=csv_path, use_cache=True, base_symbol=symbol)
 		df = df.copy()
 		df["date"] = df["date"].dt.strftime("%Y-%m-%d")
 		return JSONResponse(content=df.to_dict(orient="records"))
@@ -163,10 +172,19 @@ def get_dataset_symbol_2025_alt(symbol: str = Path(..., description="BTC|ETH|SOL
 def download_csv(start: str, end: str, symbol: str = Query("BTC")):
 	symbol = (symbol or "BTC").upper()
 	eff_end = _effective_end_date(end)
+	eff_start = _clamp_start_by_symbol(symbol, start)
 	csv_path = os.path.abspath(_symbol_csv_path(symbol))
-	df = load_or_build_dataset(start, eff_end, cache_path=csv_path, use_cache=False, base_symbol=symbol)
-	save_csv(df, csv_path)
-	return FileResponse(csv_path, media_type="text/csv", filename=f"kimchi_premium_daily_{symbol}.csv")
+	# 캐시를 증분 갱신(보존)하고, 다운로드는 별도 임시 파일로 제공합니다.
+	df = load_or_build_dataset(eff_start, eff_end, cache_path=csv_path, use_cache=True, base_symbol=symbol)
+	# 임시 파일 경로
+	from tempfile import NamedTemporaryFile
+	import shutil
+	with NamedTemporaryFile(delete=False, suffix=f"_{symbol}.csv") as tmp:
+		# 요청 구간만 저장
+		df.to_csv(tmp.name, index=False)
+		tmp_path = tmp.name
+	# 응답으로 임시 파일 제공(원본 캐시는 유지)
+	return FileResponse(tmp_path, media_type="text/csv", filename=f"kimchi_premium_daily_{symbol}.csv")
 
 
 @app.get("/realtime/{symbol}")
@@ -239,6 +257,26 @@ def get_realtime(symbol: str = Path(..., description="BTC|ETH|SOL|DOGE|XRP|ADA")
 	except Exception as e:
 		return JSONResponse(status_code=500, content={"error": str(e)})
 
+
+@app.post("/backfill/2020/{symbol}")
+def backfill_from_2020(symbol: str = Path(..., description="BTC|ETH|SOL|DOGE|XRP|ADA")):
+	"""2020-01-01부터 오늘(KST 09:30 컷오프 반영)까지 해당 심볼의 데이터를 백필하고 CSV 캐시를 갱신한다.
+	- 환율은 내부 캐시(data/usdkrw_daily.csv)가 증분 갱신되어 재사용됨
+	- 완료 후 백필된 구간의 레코드 수를 반환
+	"""
+	try:
+		symbol = (symbol or "BTC").upper()
+		start = _SYMBOL_LISTING_START.get(symbol, "2020-01-01")
+		# 오늘 기준 eff_end
+		eff_end = _effective_end_date(datetime.now().strftime("%Y-%m-%d"))
+		csv_path = os.path.abspath(_symbol_csv_path(symbol))
+		# 증분 캐시를 활용하여 전체 구간을 보장
+		df = load_or_build_dataset(start, eff_end, cache_path=csv_path, use_cache=True, base_symbol=symbol)
+		# 캐시에 이미 저장되었지만, 확실히 저장
+		save_csv(df, csv_path)
+		return {"symbol": symbol, "start": start, "end": eff_end, "rows": int(len(df))}
+	except Exception as e:
+		return JSONResponse(status_code=500, content={"error": str(e)})
 
 if __name__ == "__main__":
 	import uvicorn

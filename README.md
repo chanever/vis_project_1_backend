@@ -54,3 +54,69 @@ Kimchi Premium Backend
 - 09:30 이후: 오늘 데이터 시도. 일부 소스 지연 시 당일 행이 누락될 수 있으며, 곧 재요청 시 채워짐
 
 
+
+추가 가이드 (Step by Step)
+1) 의존성 설치
+
+   ```bash
+   pip install fastapi uvicorn pandas ccxt pyupbit requests python-dateutil
+   ```
+
+2) 환경 변수 설정(backend/.env)
+
+   ```bash
+   CMC_API_KEY=YOUR_CMC_KEY
+   FIXER_API_KEY=YOUR_FIXER_KEY
+   ```
+
+3) 서버 실행
+
+   ```bash
+   python /Users/chan/Desktop/graduate/1-1/Project_1/backend/main.py
+   ```
+
+4) 최초 백필(심볼별 1회)
+
+   ```bash
+   curl -X POST http://localhost:8000/backfill/2020/BTC
+   curl -X POST http://localhost:8000/backfill/2020/ETH
+   curl -X POST http://localhost:8000/backfill/2020/SOL
+   curl -X POST http://localhost:8000/backfill/2020/DOGE
+   curl -X POST http://localhost:8000/backfill/2020/XRP
+   curl -X POST http://localhost:8000/backfill/2020/ADA
+   ```
+
+5) 데이터 조회 예시(09:30 KST 컷오프 적용)
+
+   ```bash
+   curl "http://localhost:8000/dataset?start=2020-01-01&end=$(date +%F)&symbol=BTC"
+   ```
+
+6) 다운로드(캐시 보존, 임시 파일 응답)
+
+   ```bash
+   curl -OJ "http://localhost:8000/download?start=2020-01-01&end=$(date +%F)&symbol=BTC"
+   ```
+
+엔드포인트 요약
+- GET /health: 서버 상태
+- GET /btc_dominance: BTC dominance (1시간 내 캐시)
+- GET /dataset?start&end&symbol: 심볼별 시작일로 start 클램프, 09:30 컷오프로 end 클램프, 증분 보충 반환
+- GET /download?start&end&symbol: 캐시 보존, 요청 범위만 다운로드
+- GET /realtime/{symbol}: 현재가 기반 실시간 김프(표시용)
+- POST /backfill/2020/{symbol}: 심볼 시작일~컷오프까지 보장(증분)
+
+캐시/증분 갱신 동작
+- USD/KRW(backend/data/usdkrw_daily.csv)
+  - 캐시 마지막일+1 ~ 오늘: Fixer API로 1차 채움(USD/KRW = KRW/EUR ÷ USD/EUR)
+  - Fixer 실패/누락은 기존 스크래퍼 폴백
+  - Fixer가 공휴일 기준일을 반환하면 해당 요청일을 usd_ffill=True로 기록
+  - 오늘 행이 이미 있으면 재호출 안 함(증분 원칙)
+- 심볼 CSV(backend/data/kimchi_premium_daily_{SYMBOL}.csv)
+  - 뒤쪽 결손만 append, 앞쪽 결손은 prepend, 내부 소규모 갭(≤7일) 자동 보충
+  - 저장은 원자적 저장(임시 파일→교체)
+
+테스트 팁
+- 최신부 N행 삭제 → 다음 /dataset 호출 시 자동 보충(권장)
+- 내부 대규모 구간 삭제는 자동 복구 대상 아님 → 파일 삭제 후 /backfill 권장
+- Fixer 동작 확인: usdkrw_daily.csv의 최신부 N행 삭제 후 /dataset 요청으로 재생성 확인

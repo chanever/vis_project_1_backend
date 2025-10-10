@@ -184,17 +184,104 @@ def build_dataset(start_date: str, end_date: str, base_symbol: str = "BTC") -> p
 
 
 def save_csv(df: pd.DataFrame, path: str) -> None:
-	os.makedirs(os.path.dirname(path), exist_ok=True)
-	df.to_csv(path, index=False)
+    """원자적 저장: 임시 파일에 쓰고 교체하여 부분 손상 방지."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp_path = f"{path}.tmp"
+    df.to_csv(tmp_path, index=False)
+    try:
+        os.replace(tmp_path, path)
+    except Exception:
+        # 교체 실패 시라도 최후 수단으로 직접 저장
+        df.to_csv(path, index=False)
 
 
 def load_or_build_dataset(start_date: str, end_date: str, cache_path: Optional[str] = None, use_cache: bool = True, base_symbol: str = "BTC") -> pd.DataFrame:
-	if cache_path and use_cache and os.path.exists(cache_path):
-		df = pd.read_csv(cache_path, parse_dates=["date"])
-		mask = (df["date"] >= pd.to_datetime(start_date)) & (df["date"] <= pd.to_datetime(end_date))
-		return df.loc[mask].reset_index(drop=True)
-	
-	df = build_dataset(start_date, end_date, base_symbol=base_symbol)
-	if cache_path:
-		save_csv(df, cache_path)
-	return df 
+    """증분 캐시를 사용해 데이터셋을 반환한다.
+    - 캐시가 있으면 앞뒤 결손 구간만 빌드하여 append/prepend 후 저장
+    - 캐시가 없으면 전체 구간 빌드 후 저장
+    - 항상 [start_date, end_date] 구간으로 슬라이싱하여 반환
+    """
+    req_start_dt = pd.to_datetime(start_date).normalize()
+    req_end_dt = pd.to_datetime(end_date).normalize()
+
+    cache_df: Optional[pd.DataFrame] = None
+    if cache_path and use_cache and os.path.exists(cache_path) and os.path.getsize(cache_path) > 0:
+        try:
+            cache_df = pd.read_csv(cache_path, parse_dates=["date"])  # columns: date, usdt_close, krw_close, usdkrw, usd_ffill, greed, greed_ffill, kimchi_pct
+            cache_df["date"] = pd.to_datetime(cache_df["date"]).dt.normalize()
+            cache_df = cache_df.drop_duplicates(subset=["date"], keep="last").sort_values("date").reset_index(drop=True)
+        except Exception:
+            cache_df = None
+
+    # 캐시가 없으면 전체 빌드 후 저장
+    if cache_df is None or cache_df.empty:
+        built = build_dataset(start_date, end_date, base_symbol=base_symbol)
+        if cache_path:
+            save_csv(built, cache_path)
+        # 반환은 요청 구간 그대로
+        mask = (built["date"] >= req_start_dt) & (built["date"] <= req_end_dt)
+        return built.loc[mask].reset_index(drop=True)
+
+    # 앞/뒤 결손 구간 보정 + 소규모 중간 결손 보정
+    earliest_cached = pd.to_datetime(cache_df["date"].min()).normalize()
+    latest_cached = pd.to_datetime(cache_df["date"].max()).normalize()
+    updated_df = cache_df
+
+    # 뒤쪽 결손: (latest_cached+1) ~ req_end_dt
+    if req_end_dt > latest_cached:
+        gap_start = (latest_cached + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+        gap_end = req_end_dt.strftime("%Y-%m-%d")
+        gap_df = build_dataset(gap_start, gap_end, base_symbol=base_symbol)
+        if not gap_df.empty:
+            updated_df = pd.concat([updated_df, gap_df], ignore_index=True)
+            updated_df = updated_df.drop_duplicates(subset=["date"], keep="last").sort_values("date").reset_index(drop=True)
+            # 내부 소규모 갭도 함께 메움
+            updated_df = _fill_small_internal_gaps(updated_df, base_symbol)
+
+    # 앞쪽 결손: req_start_dt ~ (earliest_cached-1)
+    if req_start_dt < earliest_cached:
+        pre_end = (earliest_cached - pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+        pre_start = req_start_dt.strftime("%Y-%m-%d")
+        pre_df = build_dataset(pre_start, pre_end, base_symbol=base_symbol)
+        if not pre_df.empty:
+            updated_df = pd.concat([pre_df, updated_df], ignore_index=True)
+            updated_df = updated_df.drop_duplicates(subset=["date"], keep="last").sort_values("date").reset_index(drop=True)
+            # 내부 소규모 갭도 함께 메움
+            updated_df = _fill_small_internal_gaps(updated_df, base_symbol)
+
+    # 캐시 파일 갱신
+    if cache_path and use_cache:
+        save_csv(updated_df, cache_path)
+
+    # 요청 구간 슬라이스 반환
+    mask = (updated_df["date"] >= req_start_dt) & (updated_df["date"] <= req_end_dt)
+    return updated_df.loc[mask].reset_index(drop=True)
+
+
+def _detect_small_gaps(dates: pd.Series, max_gap_days: int = 7) -> list[tuple[pd.Timestamp, pd.Timestamp]]:
+    """연속 일자에서 소규모 결손 구간들을 탐지한다."""
+    if dates.empty:
+        return []
+    ds = pd.to_datetime(dates).sort_values().drop_duplicates().reset_index(drop=True)
+    gaps = []
+    for i in range(1, len(ds)):
+        prev = ds.iloc[i - 1]
+        curr = ds.iloc[i]
+        if (curr - prev).days > 1:
+            gap_len = (curr - prev).days - 1
+            if gap_len <= max_gap_days:
+                gaps.append((prev + pd.Timedelta(days=1), curr - pd.Timedelta(days=1)))
+    return gaps
+
+
+def _fill_small_internal_gaps(updated_df: pd.DataFrame, base_symbol: str) -> pd.DataFrame:
+    """소규모 내부 결손(<=7일)을 감지해 해당 범위만 빌드/병합한다."""
+    gaps = _detect_small_gaps(updated_df["date"]) if not updated_df.empty else []
+    for (g0, g1) in gaps:
+        g_start = g0.strftime("%Y-%m-%d")
+        g_end = g1.strftime("%Y-%m-%d")
+        gap_df = build_dataset(g_start, g_end, base_symbol=base_symbol)
+        if not gap_df.empty:
+            updated_df = pd.concat([updated_df, gap_df], ignore_index=True)
+            updated_df = updated_df.drop_duplicates(subset=["date"], keep="last").sort_values("date").reset_index(drop=True)
+    return updated_df
