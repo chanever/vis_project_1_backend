@@ -1,4 +1,5 @@
 import os
+import asyncio
 import json
 from fastapi import FastAPI, Query, Path
 from fastapi.middleware.cors import CORSMiddleware
@@ -62,6 +63,49 @@ def _effective_end_date(requested_end: str) -> str:
     req_end = pd.to_datetime(requested_end).date()
     eff_end = min(req_end, available_end)
     return pd.Timestamp(eff_end).strftime("%Y-%m-%d")
+
+
+# --- Daily auto-refresh at 09:35 KST (Fixer + dataset incremental backfill) ---
+async def _auto_refresh_task():
+    """Run once per day after 09:35 KST to refresh USDKRW and symbol datasets.
+    - Uses the same incremental cache logic as normal requests
+    - Safe to run even if already fresh (no-op)
+    """
+    last_run_kst_date = None
+    all_symbols = list(_SYMBOL_LISTING_START.keys())
+    while True:
+        try:
+            kst_now = datetime.now(ZoneInfo("Asia/Seoul"))
+            cutoff = kst_now.replace(hour=9, minute=35, second=0, microsecond=0)
+            today_kst = kst_now.date()
+            if (kst_now >= cutoff) and (last_run_kst_date != today_kst):
+                # Execute refresh for all symbols
+                eff_end = _effective_end_date(kst_now.strftime("%Y-%m-%d"))
+                for sym in all_symbols:
+                    try:
+                        start = _SYMBOL_LISTING_START.get(sym, "2020-01-01")
+                        csv_path = os.path.abspath(_symbol_csv_path(sym))
+                        df = load_or_build_dataset(start, eff_end, cache_path=csv_path, use_cache=True, base_symbol=sym)
+                        # Ensure persisted
+                        save_csv(df, csv_path)
+                    except Exception:
+                        # continue with next symbol on failure
+                        pass
+                last_run_kst_date = today_kst
+        except Exception:
+            # Ignore scheduler errors and continue loop
+            pass
+        # Sleep a minute between checks
+        await asyncio.sleep(60)
+
+
+@app.on_event("startup")
+async def _on_startup_schedule():
+    # Fire-and-forget background scheduler
+    try:
+        asyncio.create_task(_auto_refresh_task())
+    except Exception:
+        pass
 
 
 @app.get("/health")
