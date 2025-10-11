@@ -26,6 +26,10 @@ def _read_usd_cache() -> pd.DataFrame:
             if c not in df.columns:
                 df[c] = pd.Series(dtype="float64" if c != "date" else "datetime64[ns]")
         df = df[base_cols].sort_values("date").drop_duplicates(subset=["date"], keep="last").reset_index(drop=True)
+        
+        # 빈 값들을 이전 값으로 채우기 (forward fill)
+        df['usd_rate'] = df['usd_rate'].ffill()
+        
         return df
     except Exception:
         return pd.DataFrame(columns=["date", "usd_rate", "usd_ffill"])
@@ -35,6 +39,10 @@ def _write_usd_cache(df: pd.DataFrame) -> None:
     os.makedirs(DATA_DIR, exist_ok=True)
     out = df.copy()
     out = out.sort_values("date").drop_duplicates(subset=["date"], keep="last").reset_index(drop=True)
+    
+    # 빈 값들을 이전 값으로 채우기 (forward fill)
+    out['usd_rate'] = out['usd_rate'].ffill()
+    
     out.to_csv(USDKRW_CSV_PATH, index=False)
 
 
@@ -154,11 +162,40 @@ def _scrape_usd_rates_range_fixer(start: datetime.date, end: datetime.date) -> p
             out["date"] = pd.to_datetime(out["date"])  # normalize
             return out
 
-    # 모두 Fixer로 채워졌다면 그대로 반환
-    df = pd.DataFrame(rows, columns=["date", "usd_rate", "usd_ffill"]).dropna(subset=["usd_rate"]) 
+    # Fixer 결과를 DataFrame으로 변환
+    df = pd.DataFrame(rows, columns=["date", "usd_rate", "usd_ffill"])
     if df.empty:
         return df
     df["date"] = pd.to_datetime(df["date"]) 
+    
+    # None 값이 있는 경우 폴백 스크래퍼로 채우기
+    if df["usd_rate"].isna().any():
+        missing_mask = df["usd_rate"].isna()
+        missing_dates = df[missing_mask]["date"].dt.date.tolist()
+        if missing_dates:
+            min_missing = min(missing_dates)
+            max_missing = max(missing_dates)
+            fb_data = _scrape_usd_rates_range(min_missing, max_missing)
+            if not fb_data.empty:
+                # 폴백 데이터로 None 값만 채우기
+                for _, fb_row in fb_data.iterrows():
+                    fb_date = fb_row["date"].date()
+                    mask = df["date"].dt.date == fb_date
+                    if mask.any() and df.loc[mask, "usd_rate"].isna().any():
+                        df.loc[mask, "usd_rate"] = fb_row["usd_rate"]
+                        df.loc[mask, "usd_ffill"] = fb_row["usd_ffill"]
+    
+    # 여전히 None이 있는 경우 ffill로 채우기
+    if df["usd_rate"].isna().any():
+        # 원래 NaN이었던 위치를 미리 기록
+        original_nan_mask = df["usd_rate"].isna()
+        # ffill과 bfill을 모두 시도하여 모든 NaN 값을 채움
+        df["usd_rate"] = df["usd_rate"].ffill().bfill()
+        # ffill된 값은 True로 표시 (원래 NaN이었던 위치만)
+        df.loc[original_nan_mask, "usd_ffill"] = True
+    
+    # None이 있는 행은 제거하고 정렬하여 반환
+    df = df.dropna(subset=["usd_rate"])
     return df.sort_values("date").reset_index(drop=True)
 
 

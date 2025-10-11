@@ -179,7 +179,15 @@ def build_dataset(start_date: str, end_date: str, base_symbol: str = "BTC") -> p
 	if df.empty:
 		return pd.DataFrame(columns=["date", "usdt_close", "krw_close", "usdkrw", "usd_ffill", "greed", "greed_ffill", "kimchi_pct"]) 
 	
+	# 빈 값들을 이전 값으로 채우기 (forward fill)
+	df["usdkrw"] = df["usdkrw"].ffill()
+	df["greed"] = df["greed"].ffill()
+	df["usdt_close"] = df["usdt_close"].ffill()
+	df["krw_close"] = df["krw_close"].ffill()
+	
+	# kimchi_pct 계산 (0으로 나누기 방지)
 	df["kimchi_pct"] = (df["krw_close"] / (df["usdt_close"] * df["usdkrw"]) - 1.0) * 100.0
+	df["kimchi_pct"] = df["kimchi_pct"].ffill()  # 계산 결과도 forward fill
 	return df[["date", "usdt_close", "krw_close", "usdkrw", "usd_ffill", "greed", "greed_ffill", "kimchi_pct"]].sort_values("date").reset_index(drop=True)
 
 
@@ -187,12 +195,19 @@ def save_csv(df: pd.DataFrame, path: str) -> None:
     """원자적 저장: 임시 파일에 쓰고 교체하여 부분 손상 방지."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp_path = f"{path}.tmp"
-    df.to_csv(tmp_path, index=False)
+    
+    # 빈 값들을 이전 값으로 채우기 (forward fill)
+    df_copy = df.copy()
+    for col in ["usdkrw", "greed", "usdt_close", "krw_close", "kimchi_pct"]:
+        if col in df_copy.columns:
+            df_copy[col] = df_copy[col].ffill()
+    
+    df_copy.to_csv(tmp_path, index=False)
     try:
         os.replace(tmp_path, path)
     except Exception:
         # 교체 실패 시라도 최후 수단으로 직접 저장
-        df.to_csv(path, index=False)
+        df_copy.to_csv(path, index=False)
 
 
 def load_or_build_dataset(start_date: str, end_date: str, cache_path: Optional[str] = None, use_cache: bool = True, base_symbol: str = "BTC") -> pd.DataFrame:
@@ -210,6 +225,11 @@ def load_or_build_dataset(start_date: str, end_date: str, cache_path: Optional[s
             cache_df = pd.read_csv(cache_path, parse_dates=["date"])  # columns: date, usdt_close, krw_close, usdkrw, usd_ffill, greed, greed_ffill, kimchi_pct
             cache_df["date"] = pd.to_datetime(cache_df["date"]).dt.normalize()
             cache_df = cache_df.drop_duplicates(subset=["date"], keep="last").sort_values("date").reset_index(drop=True)
+            
+            # 빈 값들을 이전 값으로 채우기 (forward fill)
+            for col in ["usdkrw", "greed", "usdt_close", "krw_close", "kimchi_pct"]:
+                if col in cache_df.columns:
+                    cache_df[col] = cache_df[col].ffill()
         except Exception:
             cache_df = None
 
