@@ -110,7 +110,8 @@ async def _on_startup_schedule():
 
 @app.get("/health")
 def health():
-	return {"status": "ok"}
+	# 간단한 health check - 로그 출력 최소화
+	return {"status": "ok", "timestamp": datetime.now().isoformat()}
 
 
 @app.get("/btc_dominance")
