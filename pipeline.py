@@ -214,6 +214,7 @@ def load_or_build_dataset(start_date: str, end_date: str, cache_path: Optional[s
     """증분 캐시를 사용해 데이터셋을 반환한다.
     - 캐시가 있으면 앞뒤 결손 구간만 빌드하여 append/prepend 후 저장
     - 캐시가 없으면 전체 구간 빌드 후 저장
+    - 최근 3일 데이터는 항상 다시 확인하여 업데이트 (데이터 정확도 보장)
     - 항상 [start_date, end_date] 구간으로 슬라이싱하여 반환
     """
     req_start_dt = pd.to_datetime(start_date).normalize()
@@ -247,9 +248,27 @@ def load_or_build_dataset(start_date: str, end_date: str, cache_path: Optional[s
     latest_cached = pd.to_datetime(cache_df["date"].max()).normalize()
     updated_df = cache_df
 
-    # 뒤쪽 결손: (latest_cached+1) ~ req_end_dt
-    if req_end_dt > latest_cached:
-        gap_start = (latest_cached + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+    # 최근 3일 데이터 재확인 및 업데이트 (데이터 정확도 보장)
+    recent_refresh_days = 3
+    recent_start = max(earliest_cached, latest_cached - pd.Timedelta(days=recent_refresh_days - 1))
+    recent_end = max(latest_cached, req_end_dt)
+    
+    if recent_start <= recent_end:
+        recent_start_str = recent_start.strftime("%Y-%m-%d")
+        recent_end_str = recent_end.strftime("%Y-%m-%d")
+        recent_df = build_dataset(recent_start_str, recent_end_str, base_symbol=base_symbol)
+        
+        if not recent_df.empty:
+            # 기존 캐시에서 최근 3일 데이터 제거
+            updated_df = updated_df[updated_df["date"] < recent_start]
+            # 새로운 최근 데이터 추가
+            updated_df = pd.concat([updated_df, recent_df], ignore_index=True)
+            updated_df = updated_df.drop_duplicates(subset=["date"], keep="last").sort_values("date").reset_index(drop=True)
+
+    # 뒤쪽 결손: (latest_cached+1) ~ req_end_dt (최근 3일 재확인 후 업데이트된 latest_cached 기준)
+    updated_latest = pd.to_datetime(updated_df["date"].max()).normalize()
+    if req_end_dt > updated_latest:
+        gap_start = (updated_latest + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
         gap_end = req_end_dt.strftime("%Y-%m-%d")
         gap_df = build_dataset(gap_start, gap_end, base_symbol=base_symbol)
         if not gap_df.empty:
@@ -259,8 +278,9 @@ def load_or_build_dataset(start_date: str, end_date: str, cache_path: Optional[s
             updated_df = _fill_small_internal_gaps(updated_df, base_symbol)
 
     # 앞쪽 결손: req_start_dt ~ (earliest_cached-1)
-    if req_start_dt < earliest_cached:
-        pre_end = (earliest_cached - pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+    updated_earliest = pd.to_datetime(updated_df["date"].min()).normalize()
+    if req_start_dt < updated_earliest:
+        pre_end = (updated_earliest - pd.Timedelta(days=1)).strftime("%Y-%m-%d")
         pre_start = req_start_dt.strftime("%Y-%m-%d")
         pre_df = build_dataset(pre_start, pre_end, base_symbol=base_symbol)
         if not pre_df.empty:
